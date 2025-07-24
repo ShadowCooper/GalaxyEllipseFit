@@ -4,4 +4,5 @@ A script that allows you to fit ellipses to a galaxy and its polar structure. So
 
 ## Usage
 python ellipseFitting.py myFolderWithFitsFiles myDesiredOutputFolder
+
 It'll automatically re-create any subdirectories that were in the input folder in the output folder
