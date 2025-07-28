@@ -9,9 +9,9 @@ python ellipseFitting.py myFolderWithFitsFiles myDesiredOutputFolder
 ```
 
 Optional flags:
---no-plot: Don't save a final plot, only the ellipse fitting results.
---no-tex: Don't use LaTeX formatting in the final plot. If you have issues with LaTex when running the script, this fixes it.
---fast: Make the script faster by only simplifying the contour after the final polar contour candidate is chosen. Not recommended, gives significantly worse results.
+* --no-plot: Don't save a final plot, only the ellipse fitting results.
+* --no-tex: Don't use LaTeX formatting in the final plot. If you have issues with LaTex when running the script, this fixes it.
+* --fast: Make the script faster by only simplifying the contour after the final polar contour candidate is chosen. Not recommended, gives significantly worse results.
 
 Example:
 ```bash
