@@ -1,7 +1,5 @@
 import numpy as np
 import matplotlib
-
-matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.patches import Ellipse
@@ -9,11 +7,13 @@ import os
 import json
 from tqdm import tqdm
 import argparse
+import multiprocessing as mp
+from itertools import repeat
 
 from astropy.io import fits
 from astropy.visualization import ImageNormalize, HistEqStretch
 from skimage.measure import find_contours
-from scipy.optimize import minimize
+from scipy.optimize import basinhopping, minimize, differential_evolution
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.distance import pdist
 from shapely.geometry import Polygon, Point
@@ -22,10 +22,7 @@ from shapely.affinity import scale, rotate, translate
 # --- Constants ---
 M0 = 22.5
 PIXEL_SCALE = 0.262
-GALAXY_SB = 25.0
 ERROR_LOG_FILE = 'ellipseFittingErrors.txt'
-
-plt.rcParams['text.usetex'] = True
 
 
 def calculateIsophoteIntensity(targetSb, m0, pixelScale):
@@ -38,6 +35,18 @@ def smoothContour(contour, sigma=13.0):
     ySmooth = gaussian_filter1d(contour[:, 0], sigma=sigma, mode='wrap')
     xSmooth = gaussian_filter1d(contour[:, 1], sigma=sigma, mode='wrap')
     return np.column_stack((ySmooth, xSmooth))
+
+
+def createShapelyEllipse(ellipseParams):
+    """Creates a Shapely Polygon representation of an ellipse."""
+    xc, yc, sma, smi, angleDeg = (ellipseParams['xc'], ellipseParams['yc'],
+                                  ellipseParams['sma'], ellipseParams['smi'],
+                                  ellipseParams['angleDeg'])
+    circ = Point(0, 0).buffer(1)
+    ell = scale(circ, xfact=sma, yfact=smi)
+    ell = rotate(ell, angleDeg, origin=(0, 0), use_radians=False)
+    ell = translate(ell, xoff=xc, yoff=yc)
+    return ell
 
 
 def log_errors(debug_dict, error_file, basename):
@@ -56,12 +65,10 @@ def log_errors(debug_dict, error_file, basename):
     for key in sorted_keys:
         messages = debug_dict[key]
         for msg in messages:
-            if key == GALAXY_SB:
-                line = f"Galaxy Ellipse ({key}): {msg}"
-            elif isinstance(key, (float, int)):
+            if isinstance(key, (float, int)):
                 line = f"{key:.1f}: {msg}"
             else:  # For general, non-SB level errors (e.g., key='Fatal')
-                line = f"{msg}"
+                line = msg
             log_content.append(line)
 
     # --- Print to console ---
@@ -73,51 +80,92 @@ def log_errors(debug_dict, error_file, basename):
         f.write("\n".join(log_content) + "\n\n")
 
 
-def fitEllipse(contour, polarBounds=False, galAngle=None):
+def fitEllipse(contour, polarBounds=False, galaxyEllipse = None, fast = False):
     """
-    Fits an ellipse to a contour by minimizing the radial distance.
+    Fits an ellipse to a contour by minimizing the sum of the distances from each point
+    on the ellipse to the closest point on the contour.
     """
     if contour.shape[0] < 20:
         return None
+    if not polarBounds:
+        ycGuess, xcGuess = contour.mean(axis=0)
+        xCoords, yCoords = contour[:, 1] - xcGuess, contour[:, 0] - ycGuess
+        mxx, myy, mxy = np.mean(xCoords ** 2), np.mean(yCoords ** 2), np.mean(xCoords * yCoords)
 
-    ycGuess, xcGuess = contour.mean(axis=0)
-    xCoords, yCoords = contour[:, 1] - xcGuess, contour[:, 0] - ycGuess
-    mxx, myy, mxy = np.mean(xCoords ** 2), np.mean(yCoords ** 2), np.mean(xCoords * yCoords)
+        if (mxx - myy) ** 2 + 4 * mxy ** 2 < 0:
+            return None
 
-    if (mxx - myy) ** 2 + 4 * mxy ** 2 < 0:
-        return None
+        commonTerm = np.sqrt((mxx - myy) ** 2 + 4 * mxy ** 2)
+        smaGuess = np.sqrt(2 * (mxx + myy + commonTerm))
+        smiGuess = np.sqrt(2 * (mxx + myy - commonTerm))
+        angleGuessRad = 0.5 * np.arctan2(2 * mxy, mxx - myy)
+        initialGuess = [xcGuess, ycGuess, smaGuess, smiGuess, angleGuessRad]
 
-    commonTerm = np.sqrt((mxx - myy) ** 2 + 4 * mxy ** 2)
-    smaGuess = np.sqrt(2 * (mxx + myy + commonTerm))
-    smiGuess = np.sqrt(2 * (mxx + myy - commonTerm))
-    angleGuessRad = 0.5 * np.arctan2(2 * mxy, mxx - myy)
-    initialGuess = [xcGuess, ycGuess, smaGuess, smiGuess, angleGuessRad]
+        xMin, xMax, yMin, yMax = np.min(contour[:, 1]), np.max(contour[:, 1]), np.min(contour[:, 0]), np.max(contour[:, 0])
+        smaSmiUpperBound = 1.2 * (np.sqrt((xMax - xMin)**2 + (yMax - yMin)**2)) / 2
+        bounds = [(xMin, xMax), (yMin, yMax), (0, smaSmiUpperBound), (0, smaSmiUpperBound), (0, 2 * np.pi)]
+    else:
+        xcGuess, ycGuess, smaGuess, smiGuess, galAngle = galaxyEllipse['xc'], galaxyEllipse['yc'], galaxyEllipse['sma'], galaxyEllipse['smi'], galaxyEllipse['angleDeg']
+        initialGuess = [xcGuess, ycGuess, smaGuess, smiGuess, np.deg2rad((galAngle - 90))]
 
-    bounds = [(-1e99, 1e99)] * 5
-    if polarBounds:
-        bounds[-1] = ((galAngle - 110) * np.pi / 180, (galAngle - 70) * np.pi / 180)
+        xMin, xMax, yMin, yMax = np.min(contour[:, 1]), np.max(contour[:, 1]), np.min(contour[:, 0]), np.max(contour[:, 0])
+        smaSmiUpperBound = 1.2 * (np.sqrt((xMax - xMin)**2 + (yMax - yMin)**2)) / 2
+        bounds = [(xMin, xMax), (yMin, yMax), (0, smaSmiUpperBound), (0, smaSmiUpperBound), (np.deg2rad(galAngle - 110), np.deg2rad(galAngle - 70))]
 
-    def ellipse_radial_distance_objective(params, points):
+    def ellipseDist(params, contour, xy=False):
+        """
+        Calculates the sum of bidirectional distances between an ellipse and a contour.
+
+        This is the sum of:
+        1. The sum of the distances from each ellipse point to the closest contour point.
+        2. The sum of the distances from each contour point to the closest ellipse point.
+
+        If you only return the sum of the distances from each ellipse point to the closest
+        contour point, the optimizer might just make all the ellipses tiny and close to some
+        random part of the given contour. Similarly, if you only return the sum of the
+        distances from each contour point to the closest ellipse point, the fit will be
+        considered "good" as long as the parts of the ellipse that are close to the contour
+        fit the contour well in those areas.
+
+        Returns:
+            float: The total summed distance.
+        """
         xc, yc, sma, smi, angleRad = params
         if sma <= 0 or smi <= 0 or smi > sma:
-            return 1e12
+            return 1e99  # Return a large number for invalid parameters
 
-        cos_a, sin_a = np.cos(angleRad), np.sin(angleRad)
-        x_p = (points[:, 1] - xc) * cos_a + (points[:, 0] - yc) * sin_a
-        y_p = -(points[:, 1] - xc) * sin_a + (points[:, 0] - yc) * cos_a
+        # 1. Prepare coordinate arrays
+        shapelyEllipse = createShapelyEllipse({'xc': xc, 'yc': yc, 'sma': sma, 'smi': smi, 'angleDeg': np.rad2deg(angleRad)})
+        ellipsePoints = np.array(shapelyEllipse.exterior.coords)
 
-        point_angles = np.arctan2(y_p, x_p)
+        if not xy:
+            contourPoints = np.array([p[::-1] for p in contour])
+        else:
+            contourPoints = np.array(contour)
 
-        cos_pa, sin_pa = np.cos(point_angles), np.sin(point_angles)
-        if sma == 0 or smi == 0: return 1e12
-        ellipse_radii = (sma * smi) / np.sqrt((smi * cos_pa) ** 2 + (sma * sin_pa) ** 2)
+        if ellipsePoints.size == 0 or contourPoints.size == 0:
+            return 0.0
 
-        point_radii = np.hypot(x_p, y_p)
+        # 2. Compute the full pairwise distance matrix
+        distMatrix = np.linalg.norm(ellipsePoints[:, np.newaxis, :] - contourPoints[np.newaxis, :, :], axis=2)
 
-        return np.sum((point_radii - ellipse_radii) ** 2)
+        # 3. Find the minimum distances along each axis
+        ellipseToContour = np.min(distMatrix, axis=1)
+        contourToEllipse = np.min(distMatrix, axis=0)
 
-    result = minimize(ellipse_radial_distance_objective, initialGuess, args=(contour,),
-                      method='Nelder-Mead')  # don't use bfgs... nelder-mead is slow but gradient-free. had issues with bfgs.
+        # 4. Sum both sets of minimum distances and return the total
+        distSum = np.sum(ellipseToContour) + np.sum(contourToEllipse)
+
+        return distSum
+
+    #if fast:
+    #    result = minimize(ellipseDist, initialGuess, args=(contour,), method='Nelder-Mead',
+    #                      bounds=None)  # somehow it performs better when there are no bounds? at least in some cases?
+    #else:
+    #    result = differential_evolution(ellipseDist, bounds = bounds, args = (contour,))
+
+    result = minimize(ellipseDist, initialGuess, args=(contour,), method='Nelder-Mead', bounds=None)
+
     xc, yc, sma, smi, angleRad = result.x
 
     if smi > sma:
@@ -126,11 +174,11 @@ def fitEllipse(contour, polarBounds=False, galAngle=None):
     angleDeg = np.rad2deg(angleRad) % 180.0
 
     return {'xc': xc, 'yc': yc, 'sma': abs(sma), 'smi': abs(smi),
-            'angleDeg': angleDeg, 'contour': contour,
+            'angleDeg': angleDeg, 'angleRad': angleRad, 'contour': contour,
             'fit_error': result.fun}
 
 
-def simplify_contour(contour, max_dist):
+def simplify_contour(contour, max_dist, galaxyEllipse):
     """
     Removes relatively small, circuitous loops from a closed contour.
 
@@ -144,7 +192,7 @@ def simplify_contour(contour, max_dist):
                               Can be either (x, y) coordinates or (y, x) coordinates;
                               the returned contour will match the system used.
         max_dist (float): The maximum Euclidean distance to consider for a shortcut.
-                          Recommended: 0.4 * SMI (semi-major axis) of the galaxy
+                          Recommended: (0.4  or 0.5) * SMI (semi-major axis) of the galaxy
                           ellipse.
 
     Returns:
@@ -162,20 +210,31 @@ def simplify_contour(contour, max_dist):
         return np.array([])
 
     est_spacing = np.linalg.norm(np.array(work_contour)[1] - np.array(work_contour)[0])
-    min_step = 1.5 * (max_dist / est_spacing)  # what defines a "long enough" loop? If a point is within max_dist, but is >= 1.5 times greater contour distance than the contour distance that corresponds to a straight path away from the given point, then that loop should be removed.
+    min_step = 1.5 * (
+                max_dist / est_spacing)  # what defines a "long enough" loop? If a point is within max_dist, but is >= 1.5 times greater contour distance than the contour distance that corresponds to a straight path away from the given point, then that loop should be removed.
     # Ensure contour is valid and sufficiently long
     if contour is None or len(contour) < min_step:
         return contour
 
     # 2. --- PRE-PROCESSING: RE-ORDER CONTOUR ---
-    # Start the contour at the point farthest from the origin (0, 0)
-    # Use NumPy for this vectorized calculation
-    initial_points = np.array(work_contour)
-    # We can use squared distance to avoid a sqrt calculation
-    farthest_idx = np.argmax(np.sum(initial_points ** 2, axis=1))
+    # Start the contour at the point closest to the galaxy ellipse that has an angle from the horizontal +-45 degrees from the galaxy angle. This makes it unlikely that the start point is itself inside a circuitous loop.
+    gal_xc, gal_yc, galAngle, galSMA, galSMI = galaxyEllipse['xc'], galaxyEllipse['yc'], galaxyEllipse[
+        'angleDeg'], galaxyEllipse['sma'], galaxyEllipse['smi']
+    shapelyEllipse = createShapelyEllipse(
+        {'xc': gal_xc, 'yc': gal_yc, 'sma': galSMA, 'smi': galSMI, 'angleDeg': galAngle})
+    angles = np.arctan2(contour[:, 0] - gal_yc, contour[:, 1] - gal_xc)
+    angles = (angles + 2 * np.pi) % (2 * np.pi)
+    angles = angles * 180 / np.pi
 
-    # Roll the contour so the farthest point is at index 0
-    work_contour = np.roll(initial_points, -farthest_idx, axis=0).tolist()
+    minAngle = (galAngle - 45) % 360
+    maxAngle = (galAngle + 45) % 360
+    goodPoints = [(point, idx) for idx, (point, angle) in enumerate(zip(contour, angles)) if
+                  (angle - minAngle) % 360 <= (maxAngle - minAngle) % 360]
+    dists = [(shapelyEllipse.distance(Point(point[::-1])), idx) for point, idx in goodPoints]
+    closestIdx = min(dists, key=lambda x: x[0])[1]
+
+    # If we were using a NumPy array, we could use np.roll, but this way we don't have to convert back and forth
+    work_contour = work_contour[closestIdx:] + work_contour[:closestIdx]
 
     # 3. --- MAIN SIMPLIFICATION LOOP ---
     i = 0
@@ -250,8 +309,7 @@ def simplify_contour(contour, max_dist):
 
             # --- Rebuild the contour list (the efficient way) ---
             indices_to_remove = set()
-            # This loop correctly identifies the indices on the "short path"
-            # between i and j, handling wraparound.
+            # This loop correctly identifies the indices on the "short path" between i and j, handling wraparound.
             k = (i + 1) % n
             while k != j_to_connect:
                 indices_to_remove.add(k)
@@ -272,19 +330,143 @@ def simplify_contour(contour, max_dist):
     return np.array(work_contour)
 
 
-def createShapelyEllipse(ellipseParams):
-    """Creates a Shapely Polygon representation of an ellipse."""
-    xc, yc, sma, smi, angleDeg = (ellipseParams['xc'], ellipseParams['yc'],
-                                  ellipseParams['sma'], ellipseParams['smi'],
-                                  ellipseParams['angleDeg'])
-    circ = Point(0, 0).buffer(1)
-    ell = scale(circ, xfact=sma, yfact=smi)
-    ell = rotate(ell, angleDeg, origin=(0, 0), use_radians=False)
-    ell = translate(ell, xoff=xc, yoff=yc)
-    return ell
+# --- Worker function for galaxy fitting ---
+def process_galaxy_sb_level(sbLevel, data, imgCenterX, imgCenterY, M0, PIXEL_SCALE, fast):
+    """Processes a single SB level to find a galaxy candidate."""
+    intensityGal = calculateIsophoteIntensity(sbLevel, M0, PIXEL_SCALE)
+    contoursGal = find_contours(data, level=intensityGal)
+    centerContourGal = max([c for c in contoursGal if len(c) > 100 and
+                            c[:, 1].min() < imgCenterX < c[:, 1].max() and
+                            c[:, 0].min() < imgCenterY < c[:, 0].max()],
+                           key=lambda c: Polygon(c).area, default=None)
+    if centerContourGal is None:
+        return (sbLevel, 'Could not find this galaxy contour.')
+
+    prelimGalFit = fitEllipse(smoothContour(centerContourGal), fast = fast)
+    if not prelimGalFit:
+        return (sbLevel, 'Could not fit to this galaxy contour.')
+
+    prelimGalFit['sbLevelFound'] = sbLevel
+    return prelimGalFit
 
 
-def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=True):
+# Junction finding function
+def getJunctions(contour, galEllipse, minAngle, maxAngle, center):
+    gal_xc, gal_yc = center
+    angles = np.arctan2(contour[:, 0] - gal_yc, contour[:, 1] - gal_xc)
+    angles = (angles + 2 * np.pi) % (2 * np.pi)
+    angles = angles * 180 / np.pi
+    goodPoints = [(point, idx) for idx, (point, angle) in enumerate(zip(contour, angles)) if
+                  (angle - minAngle) % 360 <= (maxAngle - minAngle) % 360]
+    if len(goodPoints) == 0:
+        return None, None, None
+    dists = np.array([(galEllipse.distance(Point(point[::-1])), idx) for point, idx in goodPoints])
+    farthestPoint = max(dists, key=lambda x: x[0])
+    n = len(contour)
+
+    def pointerCalc(pointer, change, distFraction):
+        while galEllipse.distance(Point(contour[int(pointer)][::-1])) > distFraction * farthestPoint[0] and min(
+                (pointer - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer + n) % n) < int(n / 4):
+            pointer = (pointer + change) % n
+        return pointer
+
+    pointer1 = pointer2 = farthestPoint[1]
+    pointer1 = pointerCalc(pointer1, 1, 0.5)
+    pointer2 = pointerCalc(pointer2, -1, 0.5)
+
+    # If any of them was not found, try again but with distFraction = 0.7
+    if min((pointer1 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer1 + n) % n) >= int(n / 4) or min((pointer2 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer2 + n) % n) >= int(n / 4):
+        pointer1 = pointer2 = farthestPoint[1]
+        pointer1 = pointerCalc(pointer1, 1, 0.7)
+        pointer2 = pointerCalc(pointer2, -1, 0.7)
+
+    # If any of them was not found still, it failed
+    if min((pointer1 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer1 + n) % n) >= int(n / 4):
+        pointer1 = None
+    if min((pointer2 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer2 + n) % n) >= int(n / 4):
+        pointer2 = None
+    return pointer1, pointer2, farthestPoint
+
+
+# --- Worker function for polar fitting ---
+def process_polar_sb_level(sbLevel, data, galaxyContourPoly, galaxyEllipse, imgCenterX, imgCenterY, M0, PIXEL_SCALE,
+                           junctionSmoothingSigma, fast):
+    """Processes a single SB level to find polar candidates."""
+    intensity = calculateIsophoteIntensity(sbLevel, M0, PIXEL_SCALE)
+    potentialPeanuts = [c for c in find_contours(data, level=intensity) if len(c) > 200]
+
+    candidates_at_this_level = []
+    errors_at_this_level = []
+
+    gal_xc, gal_yc, galAngle = galaxyEllipse['xc'], galaxyEllipse['yc'], galaxyEllipse['angleDeg']
+    galaxyShapelyEllipse = createShapelyEllipse(galaxyEllipse)
+
+    for peanutContour in potentialPeanuts:
+        try:
+            if not Polygon(peanutContour).contains(galaxyContourPoly):
+                continue
+        except:
+            continue
+
+        smoothedPeanut = smoothContour(peanutContour, sigma=junctionSmoothingSigma)
+        if not fast:
+            smoothedPeanut = simplify_contour(smoothedPeanut, 0.5 * galaxyEllipse['smi'], galaxyEllipse)
+
+        junction1, junction2, farthestPoint1 = getJunctions(smoothedPeanut, galaxyShapelyEllipse,
+                                                            (galAngle - 135) % 360, (galAngle - 45) % 360, (gal_xc, gal_yc))
+        junction3, junction4, farthestPoint2 = getJunctions(smoothedPeanut, galaxyShapelyEllipse,
+                                                            (galAngle + 45) % 360, (galAngle + 135) % 360, (gal_xc, gal_yc))
+        junctionIndices = [junction1, junction2, junction3, junction4]
+
+        if any(x is None for x in junctionIndices):
+            errors_at_this_level.append((sbLevel, "Could not find all 4 junction points."))
+            continue
+
+        junctionIndices = [int(junctionIndex) for junctionIndex in junctionIndices]
+        junctionIndices = sorted(junctionIndices)
+        smoothedOriginalIndices = [(x, idx) for idx, x in enumerate(smoothedPeanut)]
+
+        arcs = []
+        for i in range(len(junctionIndices)):
+            start, end = junctionIndices[i], junctionIndices[(i + 1) % len(junctionIndices)]
+            arc = smoothedOriginalIndices[start:end] if end > start else smoothedOriginalIndices[
+                                                                           start:] + smoothedOriginalIndices[:end]
+            arcs.append(arc)
+
+        polarArcs, galaxyArcs = [], []
+        for arc in arcs:
+            indices = {idx for _, idx in arc}
+            if farthestPoint1[1] in indices or farthestPoint2[1] in indices:
+                polarArcs.append(np.array([pt for pt, _ in arc]))
+            else:
+                galaxyArcs.append(np.array([pt for pt, _ in arc]))
+
+        polarEllipse = fitEllipse(np.vstack(polarArcs), polarBounds = True, galaxyEllipse = galaxyEllipse, fast = fast)
+        if not polarEllipse:
+            errors_at_this_level.append((sbLevel, 'Could not fit to this processed polar contour.'))
+            continue
+
+        if polarEllipse['sma'] > max(data.shape): continue
+        if not createShapelyEllipse(polarEllipse).contains(Point(imgCenterX, imgCenterY)): continue
+
+        angleBetween = min(abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']),
+                           180 - abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']))
+        if not (70 <= angleBetween <= 110):
+            errors_at_this_level.append(
+                (sbLevel, "Angle between galaxy and polar ellipses wasn't between 70 and 110 degrees."))
+            continue
+
+        polarEllipse['sbLevelFound'] = sbLevel
+        polarEllipse['galaxyArcs'] = galaxyArcs
+        polarEllipse['polarArcs'] = polarArcs
+        polarEllipse['junctionIndices'] = junctionIndices
+        polarEllipse['smoothedPeanut'] = smoothedPeanut
+        candidates_at_this_level.append(polarEllipse)
+
+    return candidates_at_this_level, errors_at_this_level
+
+
+def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=True, useTex=True, fast = False):
     """Main analysis function with contour dissection and advanced filtering."""
     print(f"--- Analyzing {os.path.basename(fitsFilePath)} ---")
     baseName = os.path.basename(fitsFilePath)  # Keep .fits for logging clarity
@@ -316,139 +498,83 @@ def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=
     junctionSmoothingSigma = 13.0
     imgCenterY, imgCenterX = data.shape[0] / 2.0, data.shape[1] / 2.0
 
+    # For the final .jpg image with the inverted data
     invertedData = np.max(data) - data
     norm = ImageNormalize(stretch=HistEqStretch(invertedData))
 
     # --- 1. Fit the Main Galaxy ---
-    print(f"\nFitting galaxy at the {GALAXY_SB} mag/arcsec^2 isophote.")
-    intensityGal = calculateIsophoteIntensity(GALAXY_SB, M0, PIXEL_SCALE)
-    contoursGal = find_contours(data, level=intensityGal)
-    centerContourGal = max([c for c in contoursGal if len(c) > 100 and
-                            c[:, 1].min() < imgCenterX < c[:, 1].max() and
-                            c[:, 0].min() < imgCenterY < c[:, 0].max()],
-                           key=lambda c: Polygon(c).area, default=None)
-    if centerContourGal is None:
-        # FATAL ERROR 2: No galaxy contour.
-        add_error(GALAXY_SB, 'Could not find galaxy contour.')
+    print(f"\nSearching for best galaxy isophote.")
+    goodGalaxyCandidates = []
+    sb_levels_galaxy = np.arange(23.0, 25.1, 0.1)
+    sb_levels_galaxy = np.array([round(x, 1) for x in sb_levels_galaxy])
+
+    # --- MULTIPROCESSING FOR GALAXY FITTING ---
+    pool_args = zip(sb_levels_galaxy, repeat(data), repeat(imgCenterX), repeat(imgCenterY), repeat(M0),
+                    repeat(PIXEL_SCALE), repeat(fast))
+    with mp.Pool(processes=4) as pool:
+        results = pool.starmap(process_galaxy_sb_level, pool_args)
+
+    for res in results:
+        if isinstance(res, dict):
+            goodGalaxyCandidates.append(res)
+        elif isinstance(res, tuple):
+            # This is an error tuple (sbLevel, message)
+            add_error(res[0], res[1])
+
+    if not goodGalaxyCandidates:
+        # FATAL ERROR 2: No good galaxy candidates.
+        add_error('Galaxy', 'No good galaxy candidate contours.')
         log_errors(debug_log, error_log_path, baseName)
         return
 
-    galaxyEllipse = fitEllipse(smoothContour(centerContourGal))
-    if not galaxyEllipse:
-        # FATAL ERROR 3: Failed to fit galaxy.
-        add_error(GALAXY_SB, 'Failed to fit ellipse to main galaxy.')
-        log_errors(debug_log, error_log_path, baseName)
-        return
 
+    # --- FINDING BEST GALAXY CANDIDATE: Weighted average: 80% lowest fit score, 20% largest area. ---
+    fitScores = np.array([e['fit_error'] / len(e['contour']) / e['sma'] for e in goodGalaxyCandidates])
+    areaScores = np.array([np.pi * e['sma'] * e['smi'] for e in goodGalaxyCandidates])
+
+    minFitScore, maxFitScore = np.min(fitScores), np.max(fitScores)
+    minArea, maxArea = np.min(areaScores), np.max(areaScores)
+
+    # Normalizing to both the max and the min is better than just normalizing to the max. That way, a single value's "goodness" is determined by how many times greater it is than the min, and how many times smaller it is than the max, essentially.
+    fitScoresNorm = (fitScores - minFitScore) / (maxFitScore - minFitScore)
+    areaScoresNorm = (areaScores - minArea) / (maxArea - minArea)
+
+    finalScores = 0.8 * fitScoresNorm - 0.2 * areaScoresNorm
+    bestEllipseIdx = np.argmin(finalScores)
+
+    galaxyEllipse = goodGalaxyCandidates[bestEllipseIdx]
+
+    # Without weights; just best fit score
+    # galaxyEllipse = min(goodGalaxyCandidates, key = lambda e: e['fit_error'] / len(e['contour']) / e['sma'])
+
+
+    gal_xc, gal_yc, smaGal, smiGal, angleGal = galaxyEllipse['xc'], galaxyEllipse['yc'], galaxyEllipse['sma'], galaxyEllipse['smi'], galaxyEllipse['angleDeg']
     galaxyContourPoly = Polygon(galaxyEllipse['contour'])
-    galaxyShapelyEllipse = createShapelyEllipse(galaxyEllipse)
+    galaxyShapelyEllipse = createShapelyEllipse({'xc': gal_xc, 'yc': gal_yc, 'sma': smaGal, 'smi': smiGal, 'angleDeg': angleGal})
 
     # --- 2. Comprehensive Search for the Best Polar Structure Candidate ---
     print("Searching all isophotes for the best polar structure candidate...")
     good_candidates = []
 
-    gal_xc, gal_yc, galAngle = galaxyEllipse['xc'], galaxyEllipse['yc'], galaxyEllipse['angleDeg']
+    sb_levels_polar = np.arange(24.5, 27.0, 0.1)
+    sb_levels_polar = np.array([round(x, 1) for x in sb_levels_polar])
 
-    for sbLevel in np.arange(25.5, 27.5, 0.1):
-        sbLevel = round(sbLevel, 1)
-        intensity = calculateIsophoteIntensity(sbLevel, M0, PIXEL_SCALE)
+    # --- MULTIPROCESSING FOR POLAR FITTING ---
+    pool_args_polar = zip(sb_levels_polar, repeat(data), repeat(galaxyContourPoly), repeat(galaxyEllipse),
+                          repeat(imgCenterX), repeat(imgCenterY), repeat(M0), repeat(PIXEL_SCALE),
+                          repeat(junctionSmoothingSigma), repeat(fast))
+    with mp.Pool(processes=4) as pool:
+        results_polar = pool.starmap(process_polar_sb_level, pool_args_polar)
 
-        potentialPeanuts = [c for c in find_contours(data, level=intensity) if len(c) > 200]
-        for peanutContour in potentialPeanuts:
-            try:
-                if not Polygon(peanutContour).contains(galaxyContourPoly.representative_point()):
-                    continue
-            except:
-                continue
-
-            # --- Quadrant-based junction finding with pre-filtering ---
-            smoothedPeanut = smoothContour(peanutContour, sigma=junctionSmoothingSigma)
-            simplified = simplify_contour(smoothedPeanut, 0.4 * galaxyEllipse['smi'])
-
-            def getJunctions(contour, galEllipse, minAngle, maxAngle):
-                angles = np.arctan2(contour[:, 0] - gal_yc, contour[:, 1] - gal_xc)
-                angles = (angles + 2 * np.pi) % (2 * np.pi)
-                angles = angles * 180 / np.pi
-                goodPoints = [(point, idx) for idx, (point, angle) in enumerate(zip(contour, angles)) if
-                              (angle - minAngle) % 360 <= (maxAngle - minAngle) % 360]
-                if len(goodPoints) == 0:
-                    return None, None, None
-                dists = np.array([(galEllipse.distance(Point(point[::-1])), idx) for point, idx in goodPoints])
-                farthestPoint = max(dists, key=lambda x: x[0])
-                n = len(contour)
-
-                def pointerCalc(pointer, change):
-                    while galEllipse.distance(Point(contour[int(pointer)][::-1])) > 0.3 * farthestPoint[0] and min(
-                            (pointer - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer + n) % n) < int(n / 4):
-                        pointer = (pointer + change) % n
-                    return pointer
-
-                pointer1 = pointer2 = farthestPoint[1]
-                pointer1 = pointerCalc(pointer1, 1)
-                pointer2 = pointerCalc(pointer2, -1)
-                if min((pointer1 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer1 + n) % n) >= int(n / 4):
-                    pointer1 = None
-                if min((pointer2 - farthestPoint[1] + n) % n, (farthestPoint[1] - pointer2 + n) % n) >= int(n / 4):
-                    pointer2 = None
-                return pointer1, pointer2, farthestPoint
-
-            junction1, junction2, farthestPoint1 = getJunctions(simplified, galaxyShapelyEllipse,
-                                                                (galAngle - 135) % 360, (galAngle - 45) % 360)
-            junction3, junction4, farthestPoint2 = getJunctions(simplified, galaxyShapelyEllipse,
-                                                                (galAngle + 45) % 360, (galAngle + 135) % 360)
-            junctionIndices = [junction1, junction2, junction3, junction4]
-
-            if any(x is None for x in junctionIndices):
-                # NON-FATAL ERROR 4: Couldn't find junctions for this SB level.
-                add_error(sbLevel, "Could not find all 4 junction points.")
-                continue
-
-            junctionIndices = [int(junctionIndex) for junctionIndex in junctionIndices]
-            junctionIndices = sorted(junctionIndices)
-            simplifiedOriginalIndices = [(x, idx) for idx, x in enumerate(simplified)]
-
-            arcs = []
-            for i in range(len(junctionIndices)):
-                start, end = junctionIndices[i], junctionIndices[(i + 1) % len(junctionIndices)]
-                arc = simplifiedOriginalIndices[start:end] if end > start else simplifiedOriginalIndices[
-                                                                               start:] + simplifiedOriginalIndices[:end]
-                arcs.append(arc)
-
-            polarArcs, galaxyArcs = [], []
-            for arc in arcs:
-                indices = {idx for _, idx in arc}
-                if farthestPoint1[1] in indices or farthestPoint2[1] in indices:
-                    polarArcs.append(np.array([pt for pt, _ in arc]))
-                else:
-                    galaxyArcs.append(np.array([pt for pt, _ in arc]))
-
-            if not polarArcs: continue  # Should not happen if junctions are found, but good practice.
-
-            polarEllipse = fitEllipse(np.vstack(polarArcs))
-            if not polarEllipse:
-                # NON-FATAL ERROR 5: Bad fit for this SB level.
-                add_error(sbLevel, 'Could not fit to a processed contour.')
-                continue
-
-            if polarEllipse['sma'] > max(data.shape): continue
-            if not createShapelyEllipse(polarEllipse).contains(Point(imgCenterX, imgCenterY)): continue
-
-            angleBetween = min(abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']),
-                               180 - abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']))
-            if not (70 <= angleBetween <= 110):
-                # NON-FATAL ERROR 6: Angle out of range for this SB level.
-                add_error(sbLevel, "Angle between galaxy and polar ellipses wasn't between 70 and 110 degrees.")
-                continue
-
-            polarEllipse['sbLevelFound'] = sbLevel
-            polarEllipse['galaxyArcs'] = galaxyArcs
-            polarEllipse['polarArcs'] = polarArcs
-            polarEllipse['junctionIndices'] = junctionIndices
-            polarEllipse['smoothedPeanut'] = simplified
-            good_candidates.append(polarEllipse)
+    for candidates_at_level, errors_at_level in results_polar:
+        if candidates_at_level:
+            good_candidates.extend(candidates_at_level)
+        if errors_at_level:
+            for sb, msg in errors_at_level:
+                add_error(sb, msg)
 
     if not good_candidates:
-        # FATAL ERROR 7: No candidates found after checking all isophotes.
+        # FATAL ERROR 3: No candidates found after checking all isophotes.
         # This is a fatal error, so we add it to the log.
         add_error('Fatal', 'Analysis failed: After searching all isophotes, no candidate passed all filters.')
         # Now log all collected errors (fatal and non-fatal) for this file.
@@ -459,12 +585,95 @@ def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=
     # The baseName for output files should not have the .fits extension.
     outputBaseName = os.path.basename(fitsFilePath).replace('.fits', '')
 
-    bestPolarFit = min(good_candidates, key=lambda e: e['fit_error'] / len(e['contour']) / e['sma'])
+
+    # --- FINDING BEST POLAR CANDIDATE: Weighted average: 80% lowest fit score, 20% largest area. Same process as with galaxy fit. ---
+    fitScores = np.array([e['fit_error'] / len(e['contour']) / e['sma'] for e in good_candidates])
+    areaScores = np.array([np.pi * e['sma'] * e['smi'] for e in good_candidates])
+
+    minFitScore, maxFitScore = np.min(fitScores), np.max(fitScores)
+    minArea, maxArea = np.min(areaScores), np.max(areaScores)
+
+    fitScoresNorm = (fitScores - minFitScore) / (maxFitScore - minFitScore)
+    areaScoresNorm = (areaScores - minArea) / (maxArea - minArea)
+
+    finalScores = 0.8 * fitScoresNorm - 0.2 * areaScoresNorm
+    bestEllipseIdx = np.argmin(finalScores)
+
+    bestPolarFit = good_candidates[bestEllipseIdx]
+
+    # No weights, just best fit score
+    # bestPolarFit = min(good_candidates, key=lambda e: e['fit_error'] / len(e['contour']) / e['sma'])
+
+
+    # If we didn't simplify the contour before doing the preliminary fit: simplify, and redo the polar arc process and fitting for a better final fit.
+    if fast:
+        finalContour = simplify_contour(bestPolarFit['smoothedPeanut'], 0.5 * galaxyEllipse['smi'], galaxyEllipse)  # Don't use bestPolarFit['contour']; that'll make it use only the polar arcs, which will break the simplification since the simplification starts from the galaxy arcs.
+
+        junction1, junction2, farthestPoint1 = getJunctions(finalContour, galaxyShapelyEllipse,
+                                                            (angleGal - 135) % 360, (angleGal - 45) % 360, (gal_xc, gal_yc))
+        junction3, junction4, farthestPoint2 = getJunctions(finalContour, galaxyShapelyEllipse,
+                                                            (angleGal + 45) % 360, (angleGal + 135) % 360, (gal_xc, gal_yc))
+        junctionIndices = [junction1, junction2, junction3, junction4]
+
+        if any(x is None for x in junctionIndices):
+            add_error('Fatal', f'Could not find all 4 junction indices for final simplified polar contour. (SB: {bestPolarFit['sbLevelFound']})')
+            log_errors(debug_log, error_log_path, baseName)
+            return
+
+        junctionIndices = [int(junctionIndex) for junctionIndex in junctionIndices]
+        junctionIndices = sorted(junctionIndices)
+        simplifiedOriginalIndices = [(x, idx) for idx, x in enumerate(finalContour)]
+
+        arcs = []
+        for i in range(len(junctionIndices)):
+            start, end = junctionIndices[i], junctionIndices[(i + 1) % len(junctionIndices)]
+            arc = simplifiedOriginalIndices[start:end] if end > start else simplifiedOriginalIndices[
+                                                                           start:] + simplifiedOriginalIndices[:end]
+            arcs.append(arc)
+
+        polarArcs, galaxyArcs = [], []
+        for arc in arcs:
+            indices = {idx for _, idx in arc}
+            if farthestPoint1[1] in indices or farthestPoint2[1] in indices:
+                polarArcs.append(np.array([pt for pt, _ in arc]))
+            else:
+                galaxyArcs.append(np.array([pt for pt, _ in arc]))
+
+        polarEllipse = fitEllipse(np.vstack(polarArcs), polarBounds = True, galaxyEllipse = galaxyEllipse, fast = fast)
+        if not polarEllipse:
+            add_error('Fatal', 'Could not fit to the final simplified polar contour.')
+            log_errors(debug_log, error_log_path, baseName)
+            return
+
+        if polarEllipse['sma'] > max(data.shape):
+            add_error('Fatal', 'Semi-major axis of the final polar ellipse is larger than the largest image dimension.')
+            log_errors(debug_log, error_log_path, baseName)
+            return
+        if not createShapelyEllipse(polarEllipse).contains(Point(imgCenterX, imgCenterY)):
+            add_error('Fatal', 'Final polar ellipse did not contain the image center.')
+            log_errors(debug_log, error_log_path, baseName)
+            return
+
+        angleBetween = min(abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']),
+                           180 - abs(galaxyEllipse['angleDeg'] - polarEllipse['angleDeg']))
+        if not (70 <= angleBetween <= 110):
+            add_error('Fatal', 'Angle between galaxy and final polar ellipses wasn\'t between 70 and 110 degrees.')
+            log_errors(debug_log, error_log_path, baseName)
+            return
+
+        newBestEllipse = fitEllipse(finalContour, polarBounds = True, galaxyEllipse = galaxyEllipse, fast = fast)
+        bestPolarFit['xc'], bestPolarFit['yc'], bestPolarFit['sma'], bestPolarFit['smi'], bestPolarFit['angleDeg'] = newBestEllipse['xc'], newBestEllipse['yc'], newBestEllipse['sma'], newBestEllipse['smi'], newBestEllipse['angleDeg']
+        bestPolarFit['contour'] = newBestEllipse['contour']
+        bestPolarFit['galaxyArcs'], bestPolarFit['polarArcs'] = galaxyArcs, polarArcs
+        bestPolarFit['junctionIndices'] = junctionIndices
+        bestPolarFit['smoothedPeanut'] = finalContour
+
 
     # --- 3. Final Results and JSON Output ---
-    angleGal, smaGal, smiGal = galaxyEllipse['angleDeg'], galaxyEllipse['sma'], galaxyEllipse['smi']
-    anglePolar, smaPolar, smiPolar = bestPolarFit['angleDeg'], bestPolarFit['sma'], bestPolarFit['smi']
-    isophoteFoundAt = bestPolarFit['sbLevelFound']
+    # We already saved some galaxy results before
+    anglePolar, smaPolar, smiPolar, xcPolar, ycPolar = bestPolarFit['angleDeg'], bestPolarFit['sma'], bestPolarFit['smi'], bestPolarFit['xc'], bestPolarFit['yc']
+    polarIsophoteFound = bestPolarFit['sbLevelFound']
+    galaxyIsophoteFound = galaxyEllipse['sbLevelFound']
     angleBetween = min(abs(angleGal - anglePolar), 180 - abs(angleGal - anglePolar))
 
     helpString = "Angles are in degrees, measured counter-clockwise from the positive x-axis (horizontal). " \
@@ -472,9 +681,11 @@ def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=
                  "Isophotes are in mag/arcsec^2."
     resultsDict = {
         'galaxy': {'angle': round(angleGal, 2), 'sma': round(smaGal * PIXEL_SCALE, 2),
-                   'smi': round(smiGal * PIXEL_SCALE, 2), 'isophote': GALAXY_SB},
+                   'smi': round(smiGal * PIXEL_SCALE, 2), 'isophote': galaxyIsophoteFound,
+                   'xc': round(gal_xc, 2),  'yc': round(gal_yc, 2)},
         'polarStructure': {'angle': round(anglePolar, 2), 'sma': round(smaPolar * PIXEL_SCALE, 2),
-                           'smi': round(smiPolar * PIXEL_SCALE, 2), 'isophote': round(isophoteFoundAt, 1)},
+                           'smi': round(smiPolar * PIXEL_SCALE, 2), 'isophote': round(polarIsophoteFound, 1),
+                           'xc': round(xcPolar, 2), 'yc': round(ycPolar, 2)},
         'angleDiff': round(angleBetween, 2),
         'help': helpString
     }
@@ -486,7 +697,7 @@ def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=
     print("\n--- Results ---")
     print(f"Galaxy Angle: {angleGal:.2f}°, SMA: {smaGal:.2f} pix, SMI: {smiGal:.2f} pix")
     print(
-        f"Polar Angle:  {anglePolar:.2f}°, SMA: {smaPolar:.2f} pix, SMI: {smiPolar:.2f} pix (from system isophote at {isophoteFoundAt:.1f} mag/arcsec^2)")
+        f"Polar Angle:  {anglePolar:.2f}°, SMA: {smaPolar:.2f} pix, SMI: {smiPolar:.2f} pix (from polar isophote at {polarIsophoteFound:.1f} mag/arcsec^2)")
     print(f"Angle between structures: {angleBetween:.2f}°")
     print("----------------\n")
 
@@ -499,14 +710,20 @@ def analyzePolarGalaxy(fitsFilePath, outputDirectory, error_log_path, show_plot=
         ax.set_xlabel("X (pixels)")
         ax.set_ylabel("Y (pixels)")
 
-        eGal = Ellipse(xy=(galaxyEllipse['xc'], galaxyEllipse['yc']), width=2 * smaGal, height=2 * smiGal,
+        if useTex:
+            galaxyLabel = rf'Galaxy Fit (SB = {galaxyIsophoteFound} $\frac{{\mathrm{{mag}}}}{{{{\mathrm{{arcsec}}}}^2}}$)'
+            polarLabel = rf'Polar Fit (SB = {polarIsophoteFound} $\frac{{\mathrm{{mag}}}}{{{{\mathrm{{arcsec}}}}^2}}$)'
+        else:
+            galaxyLabel = f'Galaxy Fit (SB = {galaxyIsophoteFound} mag/arcsec^2)'
+            polarLabel = f'Polar Fit (SB = {polarIsophoteFound} mag/arcsec^2)'
+        eGal = Ellipse(xy=(gal_xc, gal_yc), width=2 * smaGal, height=2 * smiGal,
                        angle=angleGal, edgecolor='cyan', facecolor='none', lw=2,
-                       label=rf'Galaxy Fit (SB = {GALAXY_SB} $\frac{{\mathrm{{mag}}}}{{{{\mathrm{{arcsec}}}}^2}}$)')
+                       label=galaxyLabel)
         ax.add_patch(eGal)
 
-        ePolar = Ellipse(xy=(bestPolarFit['xc'], bestPolarFit['yc']), width=2 * smaPolar, height=2 * smiPolar,
+        ePolar = Ellipse(xy=(xcPolar, ycPolar), width=2 * smaPolar, height=2 * smiPolar,
                          angle=anglePolar, edgecolor='magenta', facecolor='none', lw=2,
-                         label=rf'Polar Fit (SB = {isophoteFoundAt} $\frac{{\mathrm{{mag}}}}{{{{\mathrm{{arcsec}}}}^2}}$)')
+                         label=polarLabel)
         ax.add_patch(ePolar)
 
         galaxyArcs = bestPolarFit['galaxyArcs']
@@ -539,11 +756,16 @@ if __name__ == '__main__':
     parser.add_argument("inputPath", help="Path to a single FITS file or a top-level directory to search.")
     parser.add_argument("outputDirectory", help="Path to the top-level directory where results will be saved.")
     parser.add_argument("--no-plot", action="store_true", help="Suppress saving the final JPG plots.")
+    parser.add_argument("--no-tex", action="store_true",
+                        help="Stop LaTeX formatting in the final JPG plots. If you are getting PyQt5/LaTeX-related errors, this will stop them.")
+    parser.add_argument("--fast", action="store_true", help="Make the script faster by only simplifying the final selected contour. May yield worse results.")
     args = parser.parse_args()
 
     inputPath = args.inputPath
     outputBaseDir = args.outputDirectory
     showPlotFlag = not args.no_plot
+    useTexFlag = not args.no_tex
+    fastFlag = args.fast
 
     if not os.path.exists(outputBaseDir):
         os.makedirs(outputBaseDir, exist_ok=True)
@@ -588,7 +810,11 @@ if __name__ == '__main__':
                 if not os.path.exists(outputDir):
                     os.makedirs(outputDir, exist_ok=True)
 
-                analyzePolarGalaxy(fitsFilePath, outputDir, ERROR_LOG_FILE, show_plot=showPlotFlag)
+                if useTexFlag:
+                    matplotlib.use('Qt5Agg')
+                    plt.rcParams['text.usetex'] = True
+
+                analyzePolarGalaxy(fitsFilePath, outputDir, ERROR_LOG_FILE, show_plot=showPlotFlag, useTex=useTexFlag, fast = fastFlag)
             except Exception as e:
                 import traceback
 
